@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -72,6 +73,7 @@ class TrainingOrchestrator:
         eval_games: int = 50,
         eval_iterations: int = 400,
         c_puct: float = 1.5,
+        event_callback: Callable[[dict], None] | None = None,
     ) -> None:
         self.game_type = game_type
         config = GAME_CONFIGS[game_type]
@@ -117,6 +119,7 @@ class TrainingOrchestrator:
         self.selfplay_games = selfplay_games
         self.device = device
         self.c_puct = c_puct
+        self.event_callback = event_callback
 
         best_model_path = self.models_dir / "best_model.pt"
         if best_model_path.exists():
@@ -125,18 +128,53 @@ class TrainingOrchestrator:
         self.version: int = 0
         self.training_log: list[dict] = self._load_training_log()
 
+    def _emit_event(self, event: dict) -> None:
+        if self.event_callback is not None:
+            try:
+                self.event_callback(event)
+            except Exception:
+                pass
+
     def train(self, num_iterations: int = 10) -> None:
         for iteration in range(num_iterations):
             iter_start = time.time()
 
+            self._emit_event({
+                "event_type": "iteration_start",
+                "iteration": iteration,
+                "version": self.version,
+                "timestamp": time.time(),
+            })
+
             self.pipeline.generate(num_games=self.selfplay_games)
+
+            self._emit_event({
+                "event_type": "selfplay_done",
+                "iteration": iteration,
+                "version": self.version,
+                "game_count": self.selfplay_games,
+                "buffer_size": len(self.buffer),
+                "timestamp": time.time(),
+            })
 
             num_steps = min(len(self.buffer) // self.batch_size, 100)
             iteration_losses: list[dict] = []
-            for _ in range(num_steps):
+            for step_idx in range(num_steps):
                 states, policies, values = self.buffer.sample(self.batch_size)
                 losses = self.trainer.train_step(states, policies, values)
                 iteration_losses.append(losses)
+
+                self._emit_event({
+                    "event_type": "train_step",
+                    "iteration": iteration,
+                    "version": self.version,
+                    "step": step_idx,
+                    "step_total": num_steps,
+                    "policy_loss": float(losses["policy_loss"]),
+                    "value_loss": float(losses["value_loss"]),
+                    "total_loss": float(losses["total_loss"]),
+                    "timestamp": time.time(),
+                })
 
             checkpoint_path = self.models_dir / f"v{self.version}.pt"
             self.trainer.save_checkpoint(str(checkpoint_path))
@@ -174,6 +212,20 @@ class TrainingOrchestrator:
                     model_champion_id=champion_id,
                 )
                 accepted = eval_result["accepted"]
+
+                self._emit_event({
+                    "event_type": "eval_done",
+                    "iteration": iteration,
+                    "version": self.version,
+                    "win_rate": eval_result["win_rate"],
+                    "wins": eval_result["wins"],
+                    "losses": eval_result["losses"],
+                    "draws": eval_result["draws"],
+                    "challenger_elo": eval_result["challenger_elo"],
+                    "champion_elo": eval_result["champion_elo"],
+                    "accepted": accepted,
+                    "timestamp": time.time(),
+                })
 
                 if accepted:
                     self.trainer.save_checkpoint(str(best_model_path))
@@ -234,11 +286,9 @@ class TrainingOrchestrator:
         return []
 
     def _save_game_record(self, record: dict) -> None:
-        records_path = self.data_dir / "game_records.json"
-        records: list[dict] = []
-        if records_path.exists():
-            with open(records_path) as f:
-                records = json.load(f)
-        records.append(record)
-        with open(records_path, "w") as f:
-            json.dump(records, f, indent=2)
+        records_dir = self.data_dir / "game_records"
+        records_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{record.get('game_id', 'unknown')}.json"
+        filepath = records_dir / filename
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(record, f, indent=2, ensure_ascii=False, default=str)

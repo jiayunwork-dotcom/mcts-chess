@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +53,71 @@ GAME_CONFIG: dict[str, dict] = {
 
 DATA_DIR: Path = Path(os.environ.get("MCTS_CHESS_DATA_DIR", "data"))
 MODELS_DIR: Path = DATA_DIR / "models"
+GAMES_DIR: Path = DATA_DIR / "game_records"
+MODEL_TAGS_FILE: Path = DATA_DIR / "model_tags.json"
+
+
+class ConnectionManager:
+    def __init__(self) -> None:
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict) -> None:
+        disconnected = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(json.dumps(message))
+            except Exception:
+                disconnected.append(connection)
+        for conn in disconnected:
+            self.disconnect(conn)
+
+
+training_manager = ConnectionManager()
+
+
+def _extract_mcts_stats(engine: MCTSEngine, top_k: int = 5) -> list[dict]:
+    root = engine._last_root
+    if root is None:
+        return []
+    sorted_children = sorted(root.children.items(), key=lambda x: x[1].N, reverse=True)
+    top5 = []
+    for action, child in sorted_children[:top_k]:
+        top5.append({
+            "action": action,
+            "visits": child.N,
+            "Q": round(child.Q / child.N, 4) if child.N > 0 else 0.0,
+            "P": round(float(child.P), 6),
+        })
+    return top5
+
+
+def _save_game_record(record: dict) -> None:
+    GAMES_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"{record['game_id']}.json"
+    filepath = GAMES_DIR / filename
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(record, f, indent=2, ensure_ascii=False, default=str)
+
+
+def _load_model_tags() -> dict[str, list[str]]:
+    if MODEL_TAGS_FILE.exists():
+        with open(MODEL_TAGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_model_tags(tags: dict[str, list[str]]) -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(MODEL_TAGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(tags, f, indent=2, ensure_ascii=False)
 
 
 class ModelManager:
@@ -107,6 +175,54 @@ class ModelManager:
                 available.add(pt_file.stem)
         return sorted(available)
 
+    def list_models_with_metadata(self) -> list[dict]:
+        import torch
+
+        result = []
+        tags_data = _load_model_tags()
+        elo_path = DATA_DIR / "elo_ratings.json"
+        elo_data: dict = {}
+        if elo_path.exists():
+            with open(elo_path, "r", encoding="utf-8") as f:
+                elo_data = json.load(f)
+
+        for version in self.list_models():
+            pt_file = self.models_dir / f"{version}.pt"
+            file_size = 0
+            created_time = None
+            if pt_file.exists():
+                stat = pt_file.stat()
+                file_size = stat.st_size
+                created_time = datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat()
+
+            elo_rating = None
+            if version in elo_data:
+                val = elo_data[version]
+                if isinstance(val, dict) and "rating" in val:
+                    elo_rating = val["rating"]
+                elif isinstance(val, (int, float)):
+                    elo_rating = val
+
+            result.append({
+                "version": version,
+                "created_time": created_time,
+                "file_size": file_size,
+                "elo_rating": elo_rating,
+                "tags": tags_data.get(version, []),
+            })
+        return result
+
+    def delete_model(self, version: str) -> bool:
+        pt_file = self.models_dir / f"{version}.pt"
+        if not pt_file.exists():
+            return False
+        pt_file.unlink()
+        self.models.pop(version, None)
+        tags_data = _load_model_tags()
+        tags_data.pop(version, None)
+        _save_model_tags(tags_data)
+        return True
+
     def get_latest_model(self) -> AlphaZeroNet | None:
         versions = self.list_models()
         if not versions:
@@ -140,18 +256,39 @@ class GameSession:
         self.engine = MCTSEngine(num_iterations=num_iterations, use_puct=False)
         self.move_history: list[dict] = []
         self.is_finished: bool = False
+        self.start_time: float = time.time()
+        self.player1_info: str = "human" if player_mode == "human_vs_ai" else (model_version or "random")
+        self.player2_info: str = model_version if player_mode == "human_vs_ai" else (model_version or "random")
+        self.initial_board: list = self.game.board.tolist()
+        self._last_engine: MCTSEngine | None = None
+
+    def _build_move_record(
+        self, action: int, player: int, board_before: np.ndarray, mcts_stats: list[dict] | None = None
+    ) -> dict:
+        return {
+            "action": action,
+            "player": player,
+            "board_before": board_before.tolist(),
+            "mcts_stats": mcts_stats or [],
+        }
 
     def make_human_move(self, action: int) -> dict:
         legal_moves = self.game.get_legal_moves()
         if action not in legal_moves:
             return {"error": "Illegal move", "legal_moves": legal_moves}
+        board_before = self.game.board.copy()
+        player = self.game.get_current_player()
         self.game = self.game.make_move(action)
-        self.move_history.append({"action": action, "player": self.game.get_current_player()})
+        move_record = self._build_move_record(action, player, board_before)
+        self.move_history.append(move_record)
         if self.game.is_game_over():
             self.is_finished = True
+            self._save_game_record()
         return self.get_state()
 
     def make_ai_move(self, model: AlphaZeroNet | None = None) -> dict:
+        board_before = self.game.board.copy()
+        player = self.game.get_current_player()
         if model is not None:
             engine = MCTSEngine(
                 num_iterations=self.engine.num_iterations,
@@ -159,13 +296,45 @@ class GameSession:
                 neural_net=model,
             )
             action = engine.get_move(self.game, move_count=len(self.move_history))
+            mcts_stats = _extract_mcts_stats(engine)
+            self._last_engine = engine
         else:
             action = self.engine.get_move(self.game, move_count=len(self.move_history))
+            mcts_stats = _extract_mcts_stats(self.engine)
+            self._last_engine = self.engine
         self.game = self.game.make_move(action)
-        self.move_history.append({"action": action, "player": self.game.get_current_player()})
+        move_record = self._build_move_record(action, player, board_before, mcts_stats)
+        self.move_history.append(move_record)
         if self.game.is_game_over():
             self.is_finished = True
+            self._save_game_record()
         return self.get_state()
+
+    def _save_game_record(self) -> None:
+        end_time = time.time()
+        result = self.game.get_result() if self.game.is_game_over() else None
+        winner = "draw"
+        if result is not None:
+            if result > 0:
+                winner = "player1"
+            elif result < 0:
+                winner = "player2"
+
+        record = {
+            "game_id": self.session_id,
+            "game_type": self.game_type,
+            "player1": self.player1_info,
+            "player2": self.player2_info,
+            "start_time": datetime.fromtimestamp(self.start_time, tz=timezone.utc).isoformat(),
+            "end_time": datetime.fromtimestamp(end_time, tz=timezone.utc).isoformat(),
+            "duration_seconds": round(end_time - self.start_time, 2),
+            "result": result,
+            "winner": winner,
+            "num_moves": len(self.move_history),
+            "initial_board": self.initial_board,
+            "moves": self.move_history,
+        }
+        _save_game_record(record)
 
     def get_state(self) -> dict:
         result = None
@@ -199,6 +368,17 @@ class MoveRequest(BaseModel):
     action: int
 
 
+class TagRequest(BaseModel):
+    tag: str
+
+
+class CompareRequest(BaseModel):
+    version1: str
+    version2: str
+    num_games: int = 20
+    game_type: str = "gomoku"
+
+
 @app.get("/games")
 def list_games() -> dict:
     return {
@@ -217,11 +397,104 @@ def list_models() -> dict:
     return {"models": model_manager.list_models()}
 
 
+@app.get("/models/metadata")
+def list_models_metadata() -> dict:
+    return {"models": model_manager.list_models_with_metadata()}
+
+
+@app.delete("/models/{version}")
+def delete_model(version: str) -> dict:
+    success = model_manager.delete_model(version)
+    if success:
+        return {"status": "deleted", "version": version}
+    return {"error": f"Model version {version} not found"}
+
+
+@app.post("/models/{version}/tags")
+def add_model_tag(version: str, request: TagRequest) -> dict:
+    tags_data = _load_model_tags()
+    if version not in tags_data:
+        tags_data[version] = []
+    if request.tag not in tags_data[version]:
+        tags_data[version].append(request.tag)
+    _save_model_tags(tags_data)
+    return {"version": version, "tags": tags_data[version]}
+
+
+@app.delete("/models/{version}/tags/{tag}")
+def remove_model_tag(version: str, tag: str) -> dict:
+    tags_data = _load_model_tags()
+    if version in tags_data and tag in tags_data[version]:
+        tags_data[version].remove(tag)
+        _save_model_tags(tags_data)
+    return {"version": version, "tags": tags_data.get(version, [])}
+
+
+@app.post("/models/compare")
+def compare_models(request: CompareRequest) -> dict:
+    model1 = model_manager.get_model(request.version1)
+    model2 = model_manager.get_model(request.version2)
+    if model1 is None:
+        return {"error": f"Model {request.version1} not found or not loaded"}
+    if model2 is None:
+        return {"error": f"Model {request.version2} not found or not loaded"}
+
+    game_class = GAME_MAP.get(request.game_type)
+    if game_class is None:
+        return {"error": f"Unknown game type: {request.game_type}"}
+
+    arena = Arena(
+        game_class=game_class,
+        num_games=request.num_games,
+        num_iterations=400,
+    )
+    result = arena.evaluate_models(
+        model_challenger=model1,
+        model_champion=model2,
+        model_challenger_id=request.version1,
+        model_champion_id=request.version2,
+    )
+    return result
+
+
+@app.get("/game-records")
+def list_game_records() -> dict:
+    GAMES_DIR.mkdir(parents=True, exist_ok=True)
+    records = []
+    for json_file in sorted(GAMES_DIR.glob("*.json"), reverse=True):
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                record = json.load(f)
+            records.append({
+                "game_id": record.get("game_id"),
+                "game_type": record.get("game_type"),
+                "player1": record.get("player1"),
+                "player2": record.get("player2"),
+                "winner": record.get("winner"),
+                "result": record.get("result"),
+                "num_moves": record.get("num_moves"),
+                "duration_seconds": record.get("duration_seconds"),
+                "start_time": record.get("start_time"),
+                "end_time": record.get("end_time"),
+            })
+        except Exception:
+            continue
+    return {"records": records}
+
+
+@app.get("/game-records/{game_id}")
+def get_game_record(game_id: str) -> dict:
+    filepath = GAMES_DIR / f"{game_id}.json"
+    if not filepath.exists():
+        return {"error": "Game record not found"}
+    with open(filepath, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 @app.post("/sessions")
 def create_session(request: CreateSessionRequest) -> dict:
     if request.game_type not in GAME_MAP:
         return {"error": f"Unknown game type: {request.game_type}"}
-    import uuid
 
     session_id = str(uuid.uuid4())
     session = GameSession(
@@ -335,6 +608,34 @@ async def websocket_game(websocket: WebSocket, session_id: str) -> None:
                 await websocket.send_text(json.dumps({"type": "error", "message": f"Unknown message type: {msg_type}"}))
     except WebSocketDisconnect:
         pass
+
+
+@app.websocket("/ws/training")
+async def websocket_training(websocket: WebSocket) -> None:
+    await training_manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        training_manager.disconnect(websocket)
+
+
+async def emit_training_event(event: dict) -> None:
+    await training_manager.broadcast(event)
+
+
+def emit_training_event_sync(event: dict) -> None:
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(emit_training_event(event))
+        else:
+            loop.run_until_complete(emit_training_event(event))
+    except RuntimeError:
+        try:
+            asyncio.run(emit_training_event(event))
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
