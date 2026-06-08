@@ -1,0 +1,32 @@
+[project]
+name = "mcts-chess"
+version = "0.1.0"
+description = "Monte Carlo Tree Search Chess AI Engine with AlphaZero-style enhancement"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+    "websockets>=11.0",
+    "plotly>=5.15",
+    "pandas>=2.0",
+    "pydantic>=2.0",
+    "aiofiles>=23.0",
+]
+
+[project.optional-dependencies]
+cpu = [
+    "torch>=2.0",
+]
+viz = [
+    "streamlit>=1.25",
+    "matplotlib>=3.7",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mcts_chess*"]
