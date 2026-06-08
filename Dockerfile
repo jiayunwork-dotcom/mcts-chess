@@ -2,10 +2,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY pyproject.toml .
-RUN pip install --no-cache-dir . || pip install --no-cache-dir numpy torch --extra-index-url https://download.pytorch.org/whl/cpu fastapi uvicorn websockets plotly pandas pydantic aiofiles streamlit matplotlib
-
 COPY . .
+
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -e ".[viz]" || \
+    pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+    numpy torch fastapi uvicorn websockets plotly pandas pydantic aiofiles streamlit matplotlib
 
 RUN mkdir -p data/models data/games
 
