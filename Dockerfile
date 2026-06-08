@@ -2,11 +2,16 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY . .
+RUN pip install --no-cache-dir \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    "torch>=2.0"
 
-RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -e ".[viz]" || \
-    pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
-    numpy torch fastapi uvicorn websockets plotly pandas pydantic aiofiles streamlit matplotlib
+COPY pyproject.toml .
+COPY mcts_chess/ mcts_chess/
+
+RUN pip install --no-cache-dir \
+    --extra-index-url https://download.pytorch.org/whl/cpu \
+    .
 
 RUN mkdir -p data/models data/games
 

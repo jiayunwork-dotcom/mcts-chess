@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import multiprocessing
-from typing import Callable
 
 import numpy as np
 import torch
@@ -49,14 +48,17 @@ def _play_game_worker(args: tuple) -> list[tuple[np.ndarray, np.ndarray, float]]
         perspective = 1.0 if i % 2 == 0 else -1.0
         value = result * perspective
 
-        if issubclass(game_class, (Gomoku, GoGame)):
+        if issubclass(game_class, GoGame):
+            board_size = state.shape[-1]
+            augmented_pairs = _augment_go(state, pol, board_size)
+        elif issubclass(game_class, Gomoku):
             board_size = state.shape[-1]
             augmented_pairs = _augment_gomoku(state, pol, board_size)
         elif issubclass(game_class, Connect4):
             augmented_pairs = _augment_connect4(state, pol)
         elif issubclass(game_class, Othello):
             board_size = state.shape[-1]
-            augmented_pairs = _augment_go(state, pol, board_size)
+            augmented_pairs = _augment_othello(state, pol, board_size)
         else:
             augmented_pairs = [(state, pol)]
 
@@ -67,6 +69,24 @@ def _play_game_worker(args: tuple) -> list[tuple[np.ndarray, np.ndarray, float]]
 
 
 def _augment_gomoku(
+    state: np.ndarray, policy: np.ndarray, board_size: int
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    results: list[tuple[np.ndarray, np.ndarray]] = []
+    policy_2d = policy.reshape(board_size, board_size)
+
+    for k in range(4):
+        rot_state = np.rot90(state, k=k, axes=(-2, -1))
+        rot_policy = np.rot90(policy_2d, k=k)
+        results.append((rot_state.copy(), rot_policy.reshape(-1).copy()))
+
+        flip_state = np.flip(rot_state, axis=-1)
+        flip_policy = np.fliplr(rot_policy)
+        results.append((flip_state.copy(), flip_policy.reshape(-1).copy()))
+
+    return results
+
+
+def _augment_othello(
     state: np.ndarray, policy: np.ndarray, board_size: int
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     results: list[tuple[np.ndarray, np.ndarray]] = []
@@ -98,16 +118,22 @@ def _augment_go(
     state: np.ndarray, policy: np.ndarray, board_size: int
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     results: list[tuple[np.ndarray, np.ndarray]] = []
-    policy_2d = policy.reshape(board_size, board_size)
+    board_cells = board_size * board_size
+    policy_board = policy[:board_cells].reshape(board_size, board_size)
+    policy_pass = policy[board_cells:]
 
     for k in range(4):
         rot_state = np.rot90(state, k=k, axes=(-2, -1))
-        rot_policy = np.rot90(policy_2d, k=k)
-        results.append((rot_state.copy(), rot_policy.reshape(-1).copy()))
+        rot_policy = np.rot90(policy_board, k=k)
+        flat_policy = rot_policy.reshape(-1)
+        aug_policy = np.concatenate([flat_policy, policy_pass])
+        results.append((rot_state.copy(), aug_policy.copy()))
 
         flip_state = np.flip(rot_state, axis=-1)
         flip_policy = np.fliplr(rot_policy)
-        results.append((flip_state.copy(), flip_policy.reshape(-1).copy()))
+        flat_flip_policy = flip_policy.reshape(-1)
+        aug_flip_policy = np.concatenate([flat_flip_policy, policy_pass])
+        results.append((flip_state.copy(), aug_flip_policy.copy()))
 
     return results
 
@@ -164,14 +190,17 @@ class SelfPlayPipeline:
             perspective = 1.0 if i % 2 == 0 else -1.0
             value = result * perspective
 
-            if issubclass(self.game_class, (Gomoku, GoGame)):
+            if issubclass(self.game_class, GoGame):
+                board_size = state.shape[-1]
+                augmented_pairs = _augment_go(state, pol, board_size)
+            elif issubclass(self.game_class, Gomoku):
                 board_size = state.shape[-1]
                 augmented_pairs = _augment_gomoku(state, pol, board_size)
             elif issubclass(self.game_class, Connect4):
                 augmented_pairs = _augment_connect4(state, pol)
             elif issubclass(self.game_class, Othello):
                 board_size = state.shape[-1]
-                augmented_pairs = _augment_go(state, pol, board_size)
+                augmented_pairs = _augment_othello(state, pol, board_size)
             else:
                 augmented_pairs = [(state, pol)]
 
@@ -188,6 +217,9 @@ class SelfPlayPipeline:
             "num_res_blocks": len(self.model.res_blocks),
             "channels": self.model.conv_in.out_channels,
         }
+        if hasattr(self.model, "board_height") and self.model.board_height != self.model.board_size:
+            model_config["board_height"] = self.model.board_height
+            model_config["board_width"] = self.model.board_width
         model_state_dict = {k: v.cpu() for k, v in self.model.state_dict().items()}
 
         if self.num_parallel > 1:
